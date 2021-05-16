@@ -1,6 +1,5 @@
 package tem.csdn
 
-import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import io.ktor.application.*
 import io.ktor.request.*
@@ -12,21 +11,20 @@ import io.ktor.http.cio.websocket.*
 import io.ktor.http.content.*
 import io.ktor.response.*
 import io.ktor.sessions.*
-import io.ktor.utils.io.charsets.*
 import io.ktor.websocket.*
+import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
-import org.jetbrains.exposed.sql.batchInsert
+import kotlinx.coroutines.launch
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
-import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import tem.csdn.dao.Messages
 import tem.csdn.dao.Users
 import tem.csdn.dao.connectToFile
 import tem.csdn.model.*
+import java.io.FileNotFoundException
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.text.Charsets
 import java.time.*
 
 fun main(args: Array<String>): Unit = io.ktor.server.cio.EngineMain.main(args)
@@ -34,7 +32,7 @@ fun main(args: Array<String>): Unit = io.ktor.server.cio.EngineMain.main(args)
 @Suppress("unused") // Referenced in application.conf
 @kotlin.jvm.JvmOverloads
 fun Application.module(testing: Boolean = false) {
-    val databaseFile = environment.config.propertyOrNull("csdnmsg.database")?.getString() ?: "data.db"
+    val databaseFile = environment.config.propertyOrNull("csdnmsg.database")?.getString() ?: "data/data.db"
     val resourcesSavePath = environment.config.propertyOrNull("csdnmsg.resources")?.getString() ?: "data"
     val resources = Resources(resourcesSavePath)
     connectToFile(databaseFile)
@@ -54,14 +52,17 @@ fun Application.module(testing: Boolean = false) {
         exception<NoParameterException> { param ->
             call.respond(HttpStatusCode.BadRequest, param.message ?: param.parameterName)
         }
-        exception<ResultException> { result ->
-            call.respond(result)
+        exception<ResultException> { resultException ->
+            call.respond(resultException.result)
+        }
+        exception<FileNotFoundException> { nouFound ->
+            call.respond(HttpStatusCode.NotFound, nouFound.message ?: "")
         }
     }
     val objectMapper = jacksonObjectMapper()
 
     routing {
-        val connections = ConcurrentHashMap<String, Connection>()
+        val sessions = ConcurrentHashMap<String, DefaultWebSocketSession>()
         get("/img/{method}/{id}") {
             // if photo then id is User.DisplayId else if image then id is Message.Id
             call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
@@ -114,12 +115,12 @@ fun Application.module(testing: Boolean = false) {
         }
         get("/count") {
             call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
-            call.respond(Result(0, null, connections.size))
+            call.respond(Result(0, null, sessions.size))
         }
         post("/csdnchat/{id}") {
             val id = call.parameters["id"]!!
             val userResultRow =
-                Users.select { Users.id eq id }.singleOrNull()
+                transaction { Users.select { Users.id eq id }.singleOrNull() }
             if (userResultRow != null) {
                 val user = userResultRow.toUser()
                 call.respond(Result(0, null, user))
@@ -143,17 +144,52 @@ fun Application.module(testing: Boolean = false) {
             }
         }
 
+        suspend fun DefaultWebSocketSession.sendRetry(frame: Frame, cnt: Int = 3): Boolean {
+            if (cnt == 0) {
+                return false
+            }
+            return try {
+                this.send(frame)
+                true
+            } catch (e: ClosedReceiveChannelException) {
+                false
+            } catch (e: Throwable) {
+                val reason = closeReason.await()!!
+                log.error("a error has throw when send retry(${cnt}):${e.message}|${reason.code}:${reason.message}", e)
+                sendRetry(frame, cnt - 1)
+            }
+        }
+
+        suspend fun DefaultWebSocketSession.sendToOther(frame: Frame) {
+            sessions.forEach { (id, session) ->
+                if (session != this) {
+                    if (!session.sendRetry(frame)) {
+                        log.error("send msg to id[${id}] has failed")
+                    }
+                }
+            }
+        }
+
+        suspend fun DefaultWebSocketSession.sendToOther(text: String) {
+            sessions.forEach { (id, session) ->
+                if (session != this) {
+                    if (!session.sendRetry(Frame.Text(text))) {
+                        log.error("send msg to id[${id}] has failed")
+                    }
+                }
+            }
+        }
+
         webSocket("/csdnchat/{id}") {
             val id = call.parameters["id"]!!
             val userResultRow =
-                Users.select { Users.id eq id }.singleOrNull() ?: Result.NOT_LOGIN.throwOut()
+                transaction { Users.select { Users.id eq id }.singleOrNull() } ?: Result.NOT_LOGIN.throwOut()
             val user = userResultRow.toUser()
-            if (connections[id] != null) {
+            if (sessions[id] != null) {
                 Result.ID_MULTI_ERROR.throwOut()
             }
             log.info("user[${user.name}](${user.displayId}) connected!")
-            val thisConnection = Connection(this)
-            connections[id] = thisConnection
+            sessions[id] = this
             try {
                 for (frame in incoming) {
                     when (frame) {
@@ -168,9 +204,7 @@ fun Application.module(testing: Boolean = false) {
                                 }
                                 row.resultedValues!!.single().toMessage(user)
                             }
-                            connections.forEach { (_, connection) ->
-                                connection.session.send(objectMapper.writeValueAsString(message))
-                            }
+                            GlobalScope.launch { sendToOther(objectMapper.writeValueAsString(message)) }
                         }
                         is Frame.Binary -> {
                             val receivedBytes = frame.readBytes()
@@ -185,9 +219,7 @@ fun Application.module(testing: Boolean = false) {
                                     resources.save(Resources.ResourcesType.IMAGE, this.id, receivedBytes)
                                 }
                             }
-                            connections.forEach { (_, connection) ->
-                                connection.session.send(objectMapper.writeValueAsString(message))
-                            }
+                            GlobalScope.launch { sendToOther(objectMapper.writeValueAsString(message)) }
                         }
                         else -> continue
                     }
@@ -199,7 +231,7 @@ fun Application.module(testing: Boolean = false) {
                 val reason = closeReason.await()!!
                 log.error("a error has throw:${e.message}|${reason.code}:${reason.message}", e)
             } finally {
-                connections.remove(id)
+                sessions.remove(id)
             }
         }
     }

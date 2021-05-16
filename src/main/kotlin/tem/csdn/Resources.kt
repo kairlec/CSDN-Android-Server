@@ -1,5 +1,6 @@
 package tem.csdn
 
+import java.io.FileNotFoundException
 import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
@@ -52,10 +53,22 @@ class Resources(private val basePath: Path) {
     }
 
     fun get(type: ResourcesType, id: String): InputStream {
-        return Files.newInputStream(basePath.resolve(type, id))
+        return basePath.resolve(type, id).let {
+            if (it.notExists()) {
+                throw FileNotFoundException(it.toString())
+            } else {
+                Files.newInputStream(it)
+            }
+        }
     }
 
     fun get(type: ResourcesType, id: Long): InputStream {
-        return Files.newInputStream(basePath.resolve(type, id))
+        return basePath.resolve(type, id).let {
+            if (it.notExists()) {
+                throw FileNotFoundException(it.toString())
+            } else {
+                Files.newInputStream(it)
+            }
+        }
     }
 }

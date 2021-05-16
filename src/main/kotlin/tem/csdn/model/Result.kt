@@ -1,6 +1,5 @@
 package tem.csdn.model
 
-import io.ktor.util.pipeline.*
 
 data class Result(
     val code: Int = 0,
