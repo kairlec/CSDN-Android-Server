@@ -18,6 +18,7 @@ import kotlinx.coroutines.launch
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.sql.update
 import tem.csdn.dao.Messages
 import tem.csdn.dao.Users
 import tem.csdn.dao.connectToFile
@@ -34,6 +35,7 @@ fun main(args: Array<String>): Unit = io.ktor.server.cio.EngineMain.main(args)
 fun Application.module(testing: Boolean = false) {
     val databaseFile = environment.config.propertyOrNull("csdnmsg.database")?.getString() ?: "data/data.db"
     val resourcesSavePath = environment.config.propertyOrNull("csdnmsg.resources")?.getString() ?: "data"
+    val chatDisplayName = environment.config.property("csdnmsg.name").getString()
     val resources = Resources(resourcesSavePath)
     connectToFile(databaseFile)
 
@@ -67,8 +69,7 @@ fun Application.module(testing: Boolean = false) {
             // if photo then id is User.DisplayId else if image then id is Message.Id
             call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
             val id = call.parameters["id"]!!
-            val method = call.parameters["method"]!!
-            when (method) {
+            when (call.parameters["method"]!!) {
                 "photo" -> {
                     call.respondOutputStream {
                         resources.get(Resources.ResourcesType.PHOTO, id).transferTo(this)
@@ -79,31 +80,41 @@ fun Application.module(testing: Boolean = false) {
                         resources.get(Resources.ResourcesType.IMAGE, id).transferTo(this)
                     }
                 }
+                "chat" -> {
+                    call.respondOutputStream {
+                        resources.get(Resources.ResourcesType.CHAT, 0).transferTo(this)
+                    }
+                }
             }
         }
         post("/photo") {
             val user = call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
             val multipart = call.receiveMultipart()
-            multipart.forEachPart {
-                if (it is PartData.FileItem) {
-                    resources.save(Resources.ResourcesType.PHOTO, user.displayId, it.streamProvider())
+            multipart.forEachPart { partData ->
+                if (partData is PartData.FileItem) {
+                    resources.save(Resources.ResourcesType.PHOTO, user.displayId, partData.streamProvider())
+                    transaction {
+                        Users.update({ Users.displayId eq user.displayId }) {
+                            it[photo] = true
+                        }
+                    }
                     return@forEachPart
                 }
             }
         }
-        get("/message") {
+        get("/messages") {
             call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
             val parameters = call.receiveParameters()
             val after = parameters["after"]?.toLongOrNull()
             val afterId = parameters["after_id"]?.toLongOrNull()
             if (after == null && afterId == null) {
                 val currentTime = LocalDate.now().plusDays(-7).toEpochSecond(LocalTime.MIN, OffsetDateTime.now().offset)
-                val messages = (Users rightJoin Messages).slice(Users.id, Messages.author).select {
+                val messages = (Users rightJoin Messages).slice(Users.displayId, Messages.author).select {
                     Messages.timestamp greaterEq currentTime
                 }.map { it.toMessage() }
                 call.respond(Result(0, null, messages))
             } else {
-                val messages = (Users rightJoin Messages).slice(Users.id, Messages.author).select {
+                val messages = (Users rightJoin Messages).slice(Users.displayId, Messages.author).select {
                     if (after != null) {
                         Messages.timestamp greaterEq after
                     } else {
@@ -112,6 +123,40 @@ fun Application.module(testing: Boolean = false) {
                 }.map { it.toMessage() }
                 call.respond(Result(0, null, messages))
             }
+        }
+        get("/profiles") {
+            call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
+            val profiles = Users.select { Users.id inList sessions.keys().toList() }.map { it.toUser() }
+            call.respond(Result(0, null, profiles))
+        }
+        post("/profile") {
+            val user = call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
+            val parameters = call.receiveParameters()
+            transaction {
+                Users.update({ Users.displayId eq user.displayId }) {
+                    parameters["name"]?.let { name ->
+                        it[Users.name] = name
+                    }
+                    parameters["displayName"]?.let { displayName ->
+                        it[Users.displayName] = displayName
+                    }
+                    parameters["position"]?.let { position ->
+                        it[Users.position] = position
+                    }
+                    parameters["github"]?.let { github ->
+                        it[Users.github] = github
+                    }
+                    parameters["qq"]?.let { qq ->
+                        it[Users.qq] = qq
+                    }
+                    parameters["weChat"]?.let { weChat ->
+                        it[Users.weChat] = weChat
+                    }
+                }
+            }
+        }
+        get("/chat_name") {
+            call.respond(Result(0, null, chatDisplayName))
         }
         get("/count") {
             call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
@@ -160,20 +205,10 @@ fun Application.module(testing: Boolean = false) {
             }
         }
 
-        suspend fun DefaultWebSocketSession.sendToOther(frame: Frame) {
+        suspend fun DefaultWebSocketSession.sendToOther(wrapper: WebSocketFrameWrapper) {
             sessions.forEach { (id, session) ->
                 if (session != this) {
-                    if (!session.sendRetry(frame)) {
-                        log.error("send msg to id[${id}] has failed")
-                    }
-                }
-            }
-        }
-
-        suspend fun DefaultWebSocketSession.sendToOther(text: String) {
-            sessions.forEach { (id, session) ->
-                if (session != this) {
-                    if (!session.sendRetry(Frame.Text(text))) {
+                    if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
                         log.error("send msg to id[${id}] has failed")
                     }
                 }
@@ -190,6 +225,14 @@ fun Application.module(testing: Boolean = false) {
             }
             log.info("user[${user.name}](${user.displayId}) connected!")
             sessions[id] = this
+            GlobalScope.launch {
+                sendToOther(
+                    WebSocketFrameWrapper(
+                        WebSocketFrameWrapper.FrameType.NEW_CONNECTION,
+                        user
+                    )
+                )
+            }
             try {
                 for (frame in incoming) {
                     when (frame) {
@@ -204,7 +247,14 @@ fun Application.module(testing: Boolean = false) {
                                 }
                                 row.resultedValues!!.single().toMessage(user)
                             }
-                            GlobalScope.launch { sendToOther(objectMapper.writeValueAsString(message)) }
+                            GlobalScope.launch {
+                                sendToOther(
+                                    WebSocketFrameWrapper(
+                                        WebSocketFrameWrapper.FrameType.MESSAGE,
+                                        message
+                                    )
+                                )
+                            }
                         }
                         is Frame.Binary -> {
                             val receivedBytes = frame.readBytes()
@@ -219,7 +269,14 @@ fun Application.module(testing: Boolean = false) {
                                     resources.save(Resources.ResourcesType.IMAGE, this.id, receivedBytes)
                                 }
                             }
-                            GlobalScope.launch { sendToOther(objectMapper.writeValueAsString(message)) }
+                            GlobalScope.launch {
+                                sendToOther(
+                                    WebSocketFrameWrapper(
+                                        WebSocketFrameWrapper.FrameType.MESSAGE,
+                                        message
+                                    )
+                                )
+                            }
                         }
                         else -> continue
                     }
@@ -231,6 +288,14 @@ fun Application.module(testing: Boolean = false) {
                 val reason = closeReason.await()!!
                 log.error("a error has throw:${e.message}|${reason.code}:${reason.message}", e)
             } finally {
+                GlobalScope.launch {
+                    sendToOther(
+                        WebSocketFrameWrapper(
+                            WebSocketFrameWrapper.FrameType.NEW_DISCONNECTION,
+                            user
+                        )
+                    )
+                }
                 sessions.remove(id)
             }
         }

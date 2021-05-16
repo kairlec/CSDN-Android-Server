@@ -24,7 +24,8 @@ class Resources(private val basePath: Path) {
 
     enum class ResourcesType(val dirname: String) {
         PHOTO("photo"),
-        IMAGE("image")
+        IMAGE("image"),
+        CHAT("chat")
         ;
     }
 
