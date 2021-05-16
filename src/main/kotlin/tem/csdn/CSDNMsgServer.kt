@@ -15,6 +15,7 @@ import io.ktor.websocket.*
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.launch
+import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -118,15 +119,17 @@ fun Application.module(testing: Boolean = false) {
                     if (after != null) {
                         Messages.timestamp greaterEq after
                     } else {
-                        Messages.id greaterEq afterId!!
+                        Messages.id greater afterId!!
                     }
                 }.map { it.toMessage() }
                 call.respond(Result(0, null, messages))
             }
         }
         get("/profiles") {
-            call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
-            val profiles = Users.select { Users.id inList sessions.keys().toList() }.map { it.toUser() }
+            val user = call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
+            val profiles =
+                Users.select { (Users.id inList sessions.keys().toList()) and (Users.displayId neq user.displayId) }
+                    .map { it.toUser() }
             call.respond(Result(0, null, profiles))
         }
         post("/profile") {
@@ -205,13 +208,14 @@ fun Application.module(testing: Boolean = false) {
             }
         }
 
-        suspend fun DefaultWebSocketSession.sendToOther(wrapper: WebSocketFrameWrapper) {
+        suspend fun DefaultWebSocketSession.sendToAll(wrapper: WebSocketFrameWrapper) {
             sessions.forEach { (id, session) ->
-                if (session != this) {
+                // 给自己也发,代表ack
+                //if (session != this) {
                     if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
                         log.error("send msg to id[${id}] has failed")
                     }
-                }
+                //}
             }
         }
 
@@ -226,7 +230,7 @@ fun Application.module(testing: Boolean = false) {
             log.info("user[${user.name}](${user.displayId}) connected!")
             sessions[id] = this
             GlobalScope.launch {
-                sendToOther(
+                sendToAll(
                     WebSocketFrameWrapper(
                         WebSocketFrameWrapper.FrameType.NEW_CONNECTION,
                         user
@@ -248,7 +252,7 @@ fun Application.module(testing: Boolean = false) {
                                 row.resultedValues!!.single().toMessage(user)
                             }
                             GlobalScope.launch {
-                                sendToOther(
+                                sendToAll(
                                     WebSocketFrameWrapper(
                                         WebSocketFrameWrapper.FrameType.MESSAGE,
                                         message
@@ -270,7 +274,7 @@ fun Application.module(testing: Boolean = false) {
                                 }
                             }
                             GlobalScope.launch {
-                                sendToOther(
+                                sendToAll(
                                     WebSocketFrameWrapper(
                                         WebSocketFrameWrapper.FrameType.MESSAGE,
                                         message
@@ -289,7 +293,7 @@ fun Application.module(testing: Boolean = false) {
                 log.error("a error has throw:${e.message}|${reason.code}:${reason.message}", e)
             } finally {
                 GlobalScope.launch {
-                    sendToOther(
+                    sendToAll(
                         WebSocketFrameWrapper(
                             WebSocketFrameWrapper.FrameType.NEW_DISCONNECTION,
                             user
