@@ -62,13 +62,18 @@ fun Application.module(testing: Boolean = false) {
             call.respond(HttpStatusCode.NotFound, nouFound.message ?: "")
         }
     }
+    install(Sessions) {
+        cookie<LoginSession>("LOGIN_SESSION")
+    }
+
+
     val objectMapper = jacksonObjectMapper()
 
     routing {
         val sessions = ConcurrentHashMap<String, DefaultWebSocketSession>()
         get("/img/{method}/{id}") {
             // if photo then id is User.DisplayId else if image then id is Message.Id
-            call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
+            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
             val id = call.parameters["id"]!!
             when (call.parameters["method"]!!) {
                 "photo" -> {
@@ -89,7 +94,7 @@ fun Application.module(testing: Boolean = false) {
             }
         }
         post("/photo") {
-            val user = call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
             val multipart = call.receiveMultipart()
             multipart.forEachPart { partData ->
                 if (partData is PartData.FileItem) {
@@ -104,36 +109,42 @@ fun Application.module(testing: Boolean = false) {
             }
         }
         get("/messages") {
-            call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
-            val parameters = call.receiveParameters()
+            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            val parameters = call.request.queryParameters
             val after = parameters["after"]?.toLongOrNull()
             val afterId = parameters["after_id"]?.toLongOrNull()
             if (after == null && afterId == null) {
                 val currentTime = LocalDate.now().plusDays(-7).toEpochSecond(LocalTime.MIN, OffsetDateTime.now().offset)
-                val messages = (Users rightJoin Messages).slice(Users.displayId, Messages.author).select {
-                    Messages.timestamp greaterEq currentTime
-                }.map { it.toMessage() }
+                val messages = transaction {
+                    (Messages leftJoin Users).slice(Messages.author, Users.displayId).select {
+                        Messages.timestamp greaterEq currentTime
+                    }.map { it.toMessage() }
+                }
                 call.respond(Result(0, null, messages))
             } else {
-                val messages = (Users rightJoin Messages).slice(Users.displayId, Messages.author).select {
-                    if (after != null) {
-                        Messages.timestamp greaterEq after
-                    } else {
-                        Messages.id greater afterId!!
-                    }
-                }.map { it.toMessage() }
+                val messages = transaction {
+                    (Messages leftJoin Users).slice(Messages.author, Users.displayId).select {
+                        if (after != null) {
+                            Messages.timestamp greaterEq after
+                        } else {
+                            Messages.id greater afterId!!
+                        }
+                    }.map { it.toMessage() }
+                }
                 call.respond(Result(0, null, messages))
             }
         }
         get("/profiles") {
-            val user = call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
             val profiles =
-                Users.select { (Users.id inList sessions.keys().toList()) and (Users.displayId neq user.displayId) }
-                    .map { it.toUser() }
+                transaction {
+                    Users.select { (Users.id inList sessions.keys().toList()) and (Users.displayId neq user.displayId) }
+                        .map { it.toUser() }
+                }
             call.respond(Result(0, null, profiles))
         }
         post("/profile") {
-            val user = call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
             val parameters = call.receiveParameters()
             transaction {
                 Users.update({ Users.displayId eq user.displayId }) {
@@ -162,16 +173,15 @@ fun Application.module(testing: Boolean = false) {
             call.respond(Result(0, null, chatDisplayName))
         }
         get("/count") {
-            call.sessions.get("user") as User? ?: Result.NOT_LOGIN.throwOut()
+            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
             call.respond(Result(0, null, sessions.size))
         }
         post("/csdnchat/{id}") {
             val id = call.parameters["id"]!!
             val userResultRow =
                 transaction { Users.select { Users.id eq id }.singleOrNull() }
-            if (userResultRow != null) {
-                val user = userResultRow.toUser()
-                call.respond(Result(0, null, user))
+            val user = if (userResultRow != null) {
+                userResultRow.toUser()
             } else {
                 val displayId = UUID.randomUUID().toString()
                 val name = "用户${('a'..'z').randomString(6)}"
@@ -188,8 +198,10 @@ fun Application.module(testing: Boolean = false) {
                         it[this.weChat] = null
                     }
                 }
-                call.respond(Result(0, null, User(displayId, name, name, "", false, null, null, null)))
+                User(displayId, name, name, "", false, null, null, null)
             }
+            call.sessions.set(LoginSession(user))
+            call.respond(Result(0, null, user))
         }
 
         suspend fun DefaultWebSocketSession.sendRetry(frame: Frame, cnt: Int = 3): Boolean {
@@ -212,9 +224,9 @@ fun Application.module(testing: Boolean = false) {
             sessions.forEach { (id, session) ->
                 // 给自己也发,代表ack
                 //if (session != this) {
-                    if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
-                        log.error("send msg to id[${id}] has failed")
-                    }
+                if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
+                    log.error("send msg to id[${id}] has failed")
+                }
                 //}
             }
         }
@@ -300,6 +312,7 @@ fun Application.module(testing: Boolean = false) {
                         )
                     )
                 }
+                log.info("session[${id}] has removed")
                 sessions.remove(id)
             }
         }

@@ -17,7 +17,7 @@ fun connectToFile(file: String) {
 
 object Users : Table() {
     val id = varchar("id", 36)
-    val displayId = varchar("display_ud", 36).uniqueIndex()
+    val displayId = varchar("display_id", 36).uniqueIndex()
     val name = varchar("name", 50)
     val displayName = varchar("display_name", 50)
     val position = varchar("position", 50)
@@ -34,7 +34,7 @@ object Messages : Table() {
     val content = varchar("content", 1024)
     val timestamp = integer("timestamp")
     val image = bool("image").nullable().default(false)
-    val author = varchar("user_id", 36) references Users.id
+    val author = varchar("user_id", 36) references Users.displayId
 
     override val primaryKey = PrimaryKey(id)
 }

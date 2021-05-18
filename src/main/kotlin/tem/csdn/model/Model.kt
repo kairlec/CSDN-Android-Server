@@ -56,3 +56,5 @@ fun ResultRow.toMessage(user: User): Message {
         user,
     )
 }
+
+data class LoginSession(val currentUser: User)
