@@ -1,6 +1,8 @@
 package tem.csdn
 
+import com.fasterxml.jackson.module.kotlin.convertValue
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 import io.ktor.application.*
 import io.ktor.request.*
 import io.ktor.routing.*
@@ -12,22 +14,22 @@ import io.ktor.http.content.*
 import io.ktor.response.*
 import io.ktor.sessions.*
 import io.ktor.websocket.*
-import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.insert
-import org.jetbrains.exposed.sql.select
+import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.update
 import tem.csdn.dao.Messages
 import tem.csdn.dao.Users
 import tem.csdn.dao.connectToFile
 import tem.csdn.model.*
 import java.io.FileNotFoundException
+import java.time.Duration
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.OffsetDateTime
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
-import java.time.*
 
 fun main(args: Array<String>): Unit = io.ktor.server.cio.EngineMain.main(args)
 
@@ -47,7 +49,7 @@ fun Application.module(testing: Boolean = false) {
     }
     install(WebSockets) {
         pingPeriod = Duration.ofSeconds(60) // Disabled (null) by default
-        timeout = Duration.ofSeconds(15)
+        timeout = Duration.ofSeconds(30)
         maxFrameSize = Long.MAX_VALUE // Disabled (max value). The connection will be closed if surpassed this length.
         masking = false
     }
@@ -71,6 +73,7 @@ fun Application.module(testing: Boolean = false) {
 
     routing {
         val sessions = ConcurrentHashMap<String, DefaultWebSocketSession>()
+        val displayIdSessions = ConcurrentHashMap<String, DefaultWebSocketSession>()
         get("/img/{method}/{id}") {
             // if photo then id is User.DisplayId else if image then id is Message.Id
             call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
@@ -116,14 +119,14 @@ fun Application.module(testing: Boolean = false) {
             if (after == null && afterId == null) {
                 val currentTime = LocalDate.now().plusDays(-7).toEpochSecond(LocalTime.MIN, OffsetDateTime.now().offset)
                 val messages = transaction {
-                    (Messages leftJoin Users).slice(Messages.author, Users.displayId).select {
+                    (Messages leftJoin Users).select {
                         Messages.timestamp greaterEq currentTime
                     }.map { it.toMessage() }
                 }
                 call.respond(Result(0, null, messages))
             } else {
                 val messages = transaction {
-                    (Messages leftJoin Users).slice(Messages.author, Users.displayId).select {
+                    (Messages leftJoin Users).select {
                         if (after != null) {
                             Messages.timestamp greaterEq after
                         } else {
@@ -138,7 +141,7 @@ fun Application.module(testing: Boolean = false) {
             val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
             val profiles =
                 transaction {
-                    Users.select { (Users.id inList sessions.keys().toList()) and (Users.displayId neq user.displayId) }
+                    Users.selectAll()// { (Users.id inList sessions.keys().toList()) and (Users.displayId neq user.displayId) }
                         .map { it.toUser() }
                 }
             call.respond(Result(0, null, profiles))
@@ -173,8 +176,12 @@ fun Application.module(testing: Boolean = false) {
             call.respond(Result(0, null, chatDisplayName))
         }
         get("/count") {
-            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
-            call.respond(Result(0, null, sessions.size))
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            if (displayIdSessions.containsKey(user.displayId)) {
+                call.respond(Result(0, null, sessions.size))
+            } else {
+                call.respond(Result(0, null, sessions.size + 1))
+            }
         }
         post("/csdnchat/{id}") {
             val id = call.parameters["id"]!!
@@ -223,11 +230,19 @@ fun Application.module(testing: Boolean = false) {
         suspend fun DefaultWebSocketSession.sendToAll(wrapper: WebSocketFrameWrapper) {
             sessions.forEach { (id, session) ->
                 // 给自己也发,代表ack
-                //if (session != this) {
                 if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
                     log.error("send msg to id[${id}] has failed")
                 }
-                //}
+            }
+        }
+
+        suspend fun DefaultWebSocketSession.sendToOther(wrapper: WebSocketFrameWrapper) {
+            sessions.forEach { (id, session) ->
+                if (session != this) {
+                    if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
+                        log.error("send msg to id[${id}] has failed")
+                    }
+                }
             }
         }
 
@@ -241,7 +256,8 @@ fun Application.module(testing: Boolean = false) {
             }
             log.info("user[${user.name}](${user.displayId}) connected!")
             sessions[id] = this
-            GlobalScope.launch {
+            displayIdSessions[user.displayId] = this
+            launch {
                 sendToAll(
                     WebSocketFrameWrapper(
                         WebSocketFrameWrapper.FrameType.NEW_CONNECTION,
@@ -249,27 +265,47 @@ fun Application.module(testing: Boolean = false) {
                     )
                 )
             }
+//            val heartBeatJob = launch {
+//                while (true) {
+//                    (this@webSocket as DefaultWebSocketSession).sendRetry(
+//                        Frame.Text(
+//                            objectMapper.writeValueAsString(
+//                                WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.HEARTBEAT, null)
+//                            )
+//                        )
+//                    )
+//                    //30s心跳一次
+//                    delay(30_1000)
+//                }
+//            }
             try {
                 for (frame in incoming) {
                     when (frame) {
                         is Frame.Text -> {
                             val receivedText = frame.readText()
-                            val message = transaction {
-                                val row = Messages.insert {
-                                    it[author] = user.displayId
-                                    it[image] = false
-                                    it[content] = receivedText
-                                    it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                            val node = objectMapper.readValue<WebSocketFrameWrapper>(receivedText)
+                            if (node.type == WebSocketFrameWrapper.FrameType.MESSAGE) {
+                                val content = node.content
+                                if (content != null) {
+                                    val contentString = objectMapper.convertValue<String>(content)
+                                    val message = transaction {
+                                        val row = Messages.insert {
+                                            it[author] = user.displayId
+                                            it[image] = false
+                                            it[Messages.content] = contentString
+                                            it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                                        }
+                                        row.resultedValues!!.single().toMessage(user)
+                                    }
+                                    launch {
+                                        sendToAll(
+                                            WebSocketFrameWrapper(
+                                                WebSocketFrameWrapper.FrameType.MESSAGE,
+                                                message
+                                            )
+                                        )
+                                    }
                                 }
-                                row.resultedValues!!.single().toMessage(user)
-                            }
-                            GlobalScope.launch {
-                                sendToAll(
-                                    WebSocketFrameWrapper(
-                                        WebSocketFrameWrapper.FrameType.MESSAGE,
-                                        message
-                                    )
-                                )
                             }
                         }
                         is Frame.Binary -> {
@@ -285,7 +321,7 @@ fun Application.module(testing: Boolean = false) {
                                     resources.save(Resources.ResourcesType.IMAGE, this.id, receivedBytes)
                                 }
                             }
-                            GlobalScope.launch {
+                            launch {
                                 sendToAll(
                                     WebSocketFrameWrapper(
                                         WebSocketFrameWrapper.FrameType.MESSAGE,
@@ -304,8 +340,9 @@ fun Application.module(testing: Boolean = false) {
                 val reason = closeReason.await()!!
                 log.error("a error has throw:${e.message}|${reason.code}:${reason.message}", e)
             } finally {
-                GlobalScope.launch {
-                    sendToAll(
+//                heartBeatJob.cancel()
+                launch {
+                    sendToOther(
                         WebSocketFrameWrapper(
                             WebSocketFrameWrapper.FrameType.NEW_DISCONNECTION,
                             user
@@ -314,6 +351,7 @@ fun Application.module(testing: Boolean = false) {
                 }
                 log.info("session[${id}] has removed")
                 sessions.remove(id)
+                displayIdSessions.remove(user.displayId)
             }
         }
     }

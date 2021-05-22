@@ -19,7 +19,7 @@
         <logback.version>1.2.1</logback.version>
         <ktor.version>1.5.4</ktor.version>
         <kotlin.compiler.incremental>true</kotlin.compiler.incremental>
-        <main.class>com.kairlec.WebhookHelperKt</main.class>
+        <main.class>tem.csdn.CSDNMsgServerKt</main.class>
         <exposed.version>0.31.1</exposed.version>
     </properties>
 
