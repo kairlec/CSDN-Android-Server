@@ -228,6 +228,7 @@ fun Application.module(testing: Boolean = false) {
         }
 
         suspend fun DefaultWebSocketSession.sendToAll(wrapper: WebSocketFrameWrapper) {
+            log.info("a new ${wrapper.type.name} event to send")
             sessions.forEach { (id, session) ->
                 // 给自己也发,代表ack
                 if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
@@ -237,6 +238,7 @@ fun Application.module(testing: Boolean = false) {
         }
 
         suspend fun DefaultWebSocketSession.sendToOther(wrapper: WebSocketFrameWrapper) {
+            log.info("a new ${wrapper.type.name} event to send")
             sessions.forEach { (id, session) ->
                 if (session != this) {
                     if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
@@ -265,69 +267,77 @@ fun Application.module(testing: Boolean = false) {
                     )
                 )
             }
-//            val heartBeatJob = launch {
-//                while (true) {
-//                    (this@webSocket as DefaultWebSocketSession).sendRetry(
-//                        Frame.Text(
-//                            objectMapper.writeValueAsString(
-//                                WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.HEARTBEAT, null)
-//                            )
-//                        )
-//                    )
-//                    //30s心跳一次
-//                    delay(30_1000)
-//                }
-//            }
+            val heartBeatJob = launch {
+                while (true) {
+                    (this@webSocket as DefaultWebSocketSession).sendRetry(
+                        Frame.Text(
+                            objectMapper.writeValueAsString(
+                                WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.HEARTBEAT, null)
+                            )
+                        )
+                    )
+                    //30s心跳一次
+                    delay(30_1000)
+                }
+            }
             try {
                 for (frame in incoming) {
                     when (frame) {
                         is Frame.Text -> {
-                            val receivedText = frame.readText()
-                            val node = objectMapper.readValue<WebSocketFrameWrapper>(receivedText)
-                            if (node.type == WebSocketFrameWrapper.FrameType.MESSAGE) {
-                                val content = node.content
-                                if (content != null) {
-                                    val contentString = objectMapper.convertValue<String>(content)
-                                    val message = transaction {
-                                        val row = Messages.insert {
-                                            it[author] = user.displayId
-                                            it[image] = false
-                                            it[Messages.content] = contentString
-                                            it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                            try {
+                                val receivedText = frame.readText()
+                                val node = objectMapper.readValue<WebSocketFrameWrapper>(receivedText)
+                                if (node.type == WebSocketFrameWrapper.FrameType.MESSAGE) {
+                                    val content = node.content
+                                    if (content != null) {
+                                        val contentString = objectMapper.convertValue<String>(content)
+                                        val message = transaction {
+                                            val row = Messages.insert {
+                                                it[author] = user.displayId
+                                                it[image] = false
+                                                it[Messages.content] = contentString
+                                                it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                                            }
+                                            row.resultedValues!!.single().toMessage(user)
                                         }
-                                        row.resultedValues!!.single().toMessage(user)
-                                    }
-                                    launch {
-                                        sendToAll(
-                                            WebSocketFrameWrapper(
-                                                WebSocketFrameWrapper.FrameType.MESSAGE,
-                                                message
+                                        launch {
+                                            sendToAll(
+                                                WebSocketFrameWrapper(
+                                                    WebSocketFrameWrapper.FrameType.MESSAGE,
+                                                    message
+                                                )
                                             )
-                                        )
+                                        }
                                     }
                                 }
+                            } catch (e: Throwable) {
+                                log.warn("wrong text format:${e.message}")
                             }
                         }
                         is Frame.Binary -> {
-                            val receivedBytes = frame.readBytes()
-                            val message = transaction {
-                                val row = Messages.insert {
-                                    it[author] = user.displayId
-                                    it[image] = true
-                                    it[content] = ""
-                                    it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                            try {
+                                val receivedBytes = frame.readBytes()
+                                val message = transaction {
+                                    val row = Messages.insert {
+                                        it[author] = user.displayId
+                                        it[image] = true
+                                        it[content] = ""
+                                        it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                                    }
+                                    row.resultedValues!!.single().toMessage(user).apply {
+                                        resources.save(Resources.ResourcesType.IMAGE, this.id, receivedBytes)
+                                    }
                                 }
-                                row.resultedValues!!.single().toMessage(user).apply {
-                                    resources.save(Resources.ResourcesType.IMAGE, this.id, receivedBytes)
-                                }
-                            }
-                            launch {
-                                sendToAll(
-                                    WebSocketFrameWrapper(
-                                        WebSocketFrameWrapper.FrameType.MESSAGE,
-                                        message
+                                launch {
+                                    sendToAll(
+                                        WebSocketFrameWrapper(
+                                            WebSocketFrameWrapper.FrameType.MESSAGE,
+                                            message
+                                        )
                                     )
-                                )
+                                }
+                            } catch (e: Throwable) {
+                                log.warn("wrong binary format:${e.message}")
                             }
                         }
                         else -> continue
@@ -340,7 +350,7 @@ fun Application.module(testing: Boolean = false) {
                 val reason = closeReason.await()!!
                 log.error("a error has throw:${e.message}|${reason.code}:${reason.message}", e)
             } finally {
-//                heartBeatJob.cancel()
+                heartBeatJob.cancel()
                 launch {
                     sendToOther(
                         WebSocketFrameWrapper(
