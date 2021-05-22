@@ -1,5 +1,6 @@
 package tem.csdn.model
 
+import com.fasterxml.jackson.annotation.JsonIgnore
 import org.jetbrains.exposed.sql.ResultRow
 import tem.csdn.dao.Messages
 import tem.csdn.dao.Users
@@ -14,6 +15,8 @@ data class User(
     val github: String?,
     val qq: String?,
     val weChat: String?,
+    @JsonIgnore
+    var lastSyncFailed: Boolean
 )
 
 data class Message(
@@ -33,7 +36,8 @@ fun ResultRow.toUser(): User {
         this[Users.photo],
         this[Users.github],
         this[Users.qq],
-        this[Users.weChat]
+        this[Users.weChat],
+        this[Users.lastSyncFail]
     )
 }
 

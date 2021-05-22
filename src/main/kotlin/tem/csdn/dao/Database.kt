@@ -25,6 +25,7 @@ object Users : Table() {
     val github = varchar("github", 256).nullable()
     val qq = varchar("qq", 20).nullable()
     val weChat = varchar("wechat", 30).nullable()
+    val lastSyncFail = bool("last_sync_failed").default(false)
 
     override val primaryKey = PrimaryKey(id)
 }

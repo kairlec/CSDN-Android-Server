@@ -23,6 +23,7 @@ import tem.csdn.dao.Messages
 import tem.csdn.dao.Users
 import tem.csdn.dao.connectToFile
 import tem.csdn.model.*
+import tem.csdn.model.Result.Companion.ID_MULTI_ERROR
 import java.io.FileNotFoundException
 import java.time.Duration
 import java.time.LocalDate
@@ -33,9 +34,9 @@ import java.util.concurrent.ConcurrentHashMap
 
 fun main(args: Array<String>): Unit = io.ktor.server.cio.EngineMain.main(args)
 
-@Suppress("unused") // Referenced in application.conf
-@kotlin.jvm.JvmOverloads
-fun Application.module(testing: Boolean = false) {
+@Suppress("unused", "BlockingMethodInNonBlockingContext", "SpellCheckingInspection")
+// Referenced in application.conf
+fun Application.module() {
     val databaseFile = environment.config.propertyOrNull("csdnmsg.database")?.getString() ?: "data/data.db"
     val resourcesSavePath = environment.config.propertyOrNull("csdnmsg.resources")?.getString() ?: "data"
     val chatDisplayName = environment.config.property("csdnmsg.name").getString()
@@ -72,8 +73,8 @@ fun Application.module(testing: Boolean = false) {
     val objectMapper = jacksonObjectMapper()
 
     routing {
-        val sessions = ConcurrentHashMap<String, DefaultWebSocketSession>()
-        val displayIdSessions = ConcurrentHashMap<String, DefaultWebSocketSession>()
+        val sessions = ConcurrentHashMap<String, Pair<User, DefaultWebSocketSession>>()
+        val displayIdSessions = ConcurrentHashMap<String, Pair<User, DefaultWebSocketSession>>()
         get("/img/{method}/{id}") {
             // if photo then id is User.DisplayId else if image then id is Message.Id
             call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
@@ -112,20 +113,19 @@ fun Application.module(testing: Boolean = false) {
             }
         }
         get("/messages") {
-            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
             val parameters = call.request.queryParameters
             val after = parameters["after"]?.toLongOrNull()
             val afterId = parameters["after_id"]?.toLongOrNull()
-            if (after == null && afterId == null) {
+            val messages = if (after == null && afterId == null) {
                 val currentTime = LocalDate.now().plusDays(-7).toEpochSecond(LocalTime.MIN, OffsetDateTime.now().offset)
-                val messages = transaction {
+                transaction {
                     (Messages leftJoin Users).select {
                         Messages.timestamp greaterEq currentTime
                     }.map { it.toMessage() }
                 }
-                call.respond(Result(0, null, messages))
             } else {
-                val messages = transaction {
+                transaction {
                     (Messages leftJoin Users).select {
                         if (after != null) {
                             Messages.timestamp greaterEq after
@@ -134,11 +134,18 @@ fun Application.module(testing: Boolean = false) {
                         }
                     }.map { it.toMessage() }
                 }
-                call.respond(Result(0, null, messages))
             }
+            if (user.lastSyncFailed) {
+                transaction {
+                    Users.update({ Users.displayId eq user.displayId }) {
+                        it[lastSyncFail] = false
+                    }
+                }
+            }
+            call.respond(Result(0, null, messages))
         }
         get("/profiles") {
-            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
             val profiles =
                 transaction {
                     Users.selectAll()// { (Users.id inList sessions.keys().toList()) and (Users.displayId neq user.displayId) }
@@ -203,9 +210,10 @@ fun Application.module(testing: Boolean = false) {
                         it[this.github] = null
                         it[this.qq] = null
                         it[this.weChat] = null
+                        it[this.lastSyncFail] = false
                     }
                 }
-                User(displayId, name, name, "", false, null, null, null)
+                User(displayId, name, name, "", false, null, null, null, false)
             }
             call.sessions.set(LoginSession(user))
             call.respond(Result(0, null, user))
@@ -227,23 +235,58 @@ fun Application.module(testing: Boolean = false) {
             }
         }
 
+        suspend fun Pair<User, DefaultWebSocketSession>.trySendSync(id: String, wrapper: WebSocketFrameWrapper) {
+            if (!this.second.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
+                log.error("send msg to id[${id}] has failed")
+                transaction {
+                    Users.update({ Users.displayId eq this@trySendSync.first.displayId }) {
+                        it[lastSyncFail] = true
+                    }
+                }
+                this.first.lastSyncFailed = true
+            }
+        }
+
         suspend fun DefaultWebSocketSession.sendToAll(wrapper: WebSocketFrameWrapper) {
-            log.info("a new ${wrapper.type.name} event to send")
-            sessions.forEach { (id, session) ->
+            log.info("(all)a new ${wrapper.type.name} event to send")
+            sessions.forEach { (id, sessionPair) ->
                 // 给自己也发,代表ack
-                if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
-                    log.error("send msg to id[${id}] has failed")
+                if (!sessionPair.first.lastSyncFailed) {
+                    sessionPair.trySendSync(id, wrapper)
+                } else {
+                    (sessionPair.second as DefaultWebSocketServerSession).sendRetry(
+                        Frame.Text(
+                            objectMapper.writeValueAsString(
+                                WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.NEED_SYNC, null)
+                            )
+                        )
+                    )
                 }
             }
         }
 
+        suspend fun DefaultWebSocketSession.sendToSelf(wrapper: WebSocketFrameWrapper) {
+            log.info("(self)a new ${wrapper.type.name} event to send")
+            if (!this.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
+                log.error("send msg to self has failed")
+            }
+        }
+
         suspend fun DefaultWebSocketSession.sendToOther(wrapper: WebSocketFrameWrapper) {
-            log.info("a new ${wrapper.type.name} event to send")
-            sessions.forEach { (id, session) ->
-                if (session != this) {
-                    if (!session.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
-                        log.error("send msg to id[${id}] has failed")
+            log.info("(other)a new ${wrapper.type.name} event to send")
+            sessions.forEach { (id, sessionPair) ->
+                if (!sessionPair.first.lastSyncFailed) {
+                    if (sessionPair.second != this) {
+                        sessionPair.trySendSync(id, wrapper)
                     }
+                }else{
+                    (sessionPair.second as DefaultWebSocketServerSession).sendRetry(
+                        Frame.Text(
+                            objectMapper.writeValueAsString(
+                                WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.NEED_SYNC, null)
+                            )
+                        )
+                    )
                 }
             }
         }
@@ -254,11 +297,12 @@ fun Application.module(testing: Boolean = false) {
                 transaction { Users.select { Users.id eq id }.singleOrNull() } ?: Result.NOT_LOGIN.throwOut()
             val user = userResultRow.toUser()
             if (sessions[id] != null) {
-                Result.ID_MULTI_ERROR.throwOut()
+                sessions[id]!!.second.close(CloseReason(CloseReason.Codes.NORMAL, ID_MULTI_ERROR.msg!!))
             }
             log.info("user[${user.name}](${user.displayId}) connected!")
-            sessions[id] = this
-            displayIdSessions[user.displayId] = this
+            val sessionPair = user to this
+            sessions[id] = sessionPair
+            displayIdSessions[user.displayId] = sessionPair
             launch {
                 sendToAll(
                     WebSocketFrameWrapper(
@@ -267,12 +311,28 @@ fun Application.module(testing: Boolean = false) {
                     )
                 )
             }
+            // 上次有同步失败的,发送强制同步信息
+            if (user.lastSyncFailed) {
+                sendToSelf(
+                    WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.NEED_SYNC, null)
+                )
+            }
+            var lastHeartBeatUUIDString: String? = null
             val heartBeatJob = launch {
                 while (true) {
+                    if (lastHeartBeatUUIDString != null) {
+                        val exp = HeartBeatException.HeartBeatTimeoutException()
+                        close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, exp.toString()))
+                        break
+                    }
+                    lastHeartBeatUUIDString = UUID.randomUUID().toString()
                     (this@webSocket as DefaultWebSocketSession).sendRetry(
                         Frame.Text(
                             objectMapper.writeValueAsString(
-                                WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.HEARTBEAT, null)
+                                WebSocketFrameWrapper(
+                                    WebSocketFrameWrapper.FrameType.HEARTBEAT,
+                                    lastHeartBeatUUIDString
+                                )
                             )
                         )
                     )
@@ -280,6 +340,12 @@ fun Application.module(testing: Boolean = false) {
                     delay(30_1000)
                 }
             }
+//            //上一次有未收到的消息,这次websocket重连时同步
+//            if (user.lastSyncFailedMessageId != -1L) {
+//                transaction {
+//                    Messages.select { Messages.id greaterEq user.lastSyncFailedMessageId }
+//                }
+//            }
             try {
                 for (frame in incoming) {
                     when (frame) {
@@ -287,28 +353,60 @@ fun Application.module(testing: Boolean = false) {
                             try {
                                 val receivedText = frame.readText()
                                 val node = objectMapper.readValue<WebSocketFrameWrapper>(receivedText)
-                                if (node.type == WebSocketFrameWrapper.FrameType.MESSAGE) {
-                                    val content = node.content
-                                    if (content != null) {
-                                        val contentString = objectMapper.convertValue<String>(content)
-                                        val message = transaction {
-                                            val row = Messages.insert {
-                                                it[author] = user.displayId
-                                                it[image] = false
-                                                it[Messages.content] = contentString
-                                                it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                                when (node.type) {
+                                    WebSocketFrameWrapper.FrameType.MESSAGE -> {
+                                        val content = node.content
+                                        if (content != null) {
+                                            val contentString = objectMapper.convertValue<String>(content)
+                                            val message = transaction {
+                                                val row = Messages.insert {
+                                                    it[author] = user.displayId
+                                                    it[image] = false
+                                                    it[Messages.content] = contentString
+                                                    it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                                                }
+                                                row.resultedValues!!.single().toMessage(user)
                                             }
-                                            row.resultedValues!!.single().toMessage(user)
+                                            launch {
+                                                sendToAll(
+                                                    WebSocketFrameWrapper(
+                                                        WebSocketFrameWrapper.FrameType.MESSAGE,
+                                                        message
+                                                    )
+                                                )
+                                            }
                                         }
-                                        launch {
-                                            sendToAll(
+                                    }
+                                    // 收到心跳包,发送心跳回包
+                                    WebSocketFrameWrapper.FrameType.HEARTBEAT -> {
+                                        val content = node.content
+                                        if (content != null) {
+                                            val contentString = objectMapper.convertValue<String>(content)
+                                            sendToSelf(
                                                 WebSocketFrameWrapper(
-                                                    WebSocketFrameWrapper.FrameType.MESSAGE,
-                                                    message
+                                                    WebSocketFrameWrapper.FrameType.HEARTBEAT_ACK,
+                                                    contentString
                                                 )
                                             )
                                         }
                                     }
+                                    // 收到心跳回包
+                                    WebSocketFrameWrapper.FrameType.HEARTBEAT_ACK -> {
+                                        val content = node.content
+                                        if (content != null) {
+                                            val contentString = objectMapper.convertValue<String>(content)
+                                            //心跳回包内容异常,断开连接
+                                            if (contentString != lastHeartBeatUUIDString) {
+                                                val exp = HeartBeatException.HeartBeatContentMismatchException(
+                                                    lastHeartBeatUUIDString ?: "null",
+                                                    contentString
+                                                )
+                                                close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, exp.toString()))
+                                            }
+                                            lastHeartBeatUUIDString = null
+                                        }
+                                    }
+                                    else -> continue
                                 }
                             } catch (e: Throwable) {
                                 log.warn("wrong text format:${e.message}")
