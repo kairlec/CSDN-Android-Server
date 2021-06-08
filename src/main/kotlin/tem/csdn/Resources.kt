@@ -4,57 +4,50 @@ import java.io.FileNotFoundException
 import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
-import kotlin.io.path.notExists
+import kotlin.io.path.*
 
-class Resources(private val basePath: Path) {
+class ResourcesSaveResult(
+    val sha256: String,
+    val path: Path
+) {
+    fun <T> `try`(event: Path.(String) -> T): T {
+        try {
+            return event(path, sha256)
+        } catch (e: Throwable) {
+            path.deleteIfExists()
+            throw e
+        }
+    }
+}
+
+class Resources(basePath: Path) {
+    companion object {
+        const val DIR_NAME = "images"
+    }
+
+    private val imagesBasePath = basePath.resolve(DIR_NAME)
+
     constructor(basePath: String) : this(Path.of(basePath))
 
     init {
-        if (basePath.notExists()) {
-            Files.createDirectories(basePath)
-        }
-        ResourcesType.values().forEach {
-            basePath.resolve(it.dirname).run {
-                if (this.notExists()) {
-                    Files.createDirectories(this)
-                }
-            }
+        if (imagesBasePath.notExists()) {
+            Files.createDirectories(imagesBasePath)
         }
     }
 
-    enum class ResourcesType(val dirname: String) {
-        PHOTO("photo"),
-        IMAGE("image"),
-        CHAT("chat")
-        ;
+    fun save(data: InputStream): ResourcesSaveResult {
+        return save(data.readAllBytes())
     }
 
-    private fun Path.resolve(type: ResourcesType, id: String): Path {
-        return this.resolve(type.dirname).resolve(id)
+    fun save(data: ByteArray): ResourcesSaveResult {
+        val sha256 = data.sha256()
+        val path = imagesBasePath.resolve(sha256)
+        Files.write(path, data)
+        return ResourcesSaveResult(sha256, path)
     }
 
-    private fun Path.resolve(type: ResourcesType, id: Long): Path {
-        return this.resolve(type.dirname).resolve(id.toString())
-    }
-
-    fun save(type: ResourcesType, id: String, data: InputStream): Long {
-        return data.transferTo(Files.newOutputStream(basePath.resolve(type, id)))
-    }
-
-    fun save(type: ResourcesType, id: Long, data: InputStream): Long {
-        return data.transferTo(Files.newOutputStream(basePath.resolve(type, id)))
-    }
-
-    fun save(type: ResourcesType, id: String, data: ByteArray) {
-        Files.write(basePath.resolve(type, id), data)
-    }
-
-    fun save(type: ResourcesType, id: Long, data: ByteArray) {
-        Files.write(basePath.resolve(type, id), data)
-    }
-
-    fun get(type: ResourcesType, id: String): InputStream {
-        return basePath.resolve(type, id).let {
+    fun get(sha256: String): InputStream {
+        return imagesBasePath.resolve(sha256).let {
             if (it.notExists()) {
                 throw FileNotFoundException(it.toString())
             } else {
@@ -63,13 +56,7 @@ class Resources(private val basePath: Path) {
         }
     }
 
-    fun get(type: ResourcesType, id: Long): InputStream {
-        return basePath.resolve(type, id).let {
-            if (it.notExists()) {
-                throw FileNotFoundException(it.toString())
-            } else {
-                Files.newInputStream(it)
-            }
-        }
+    fun exists(sha256: String): Boolean {
+        return imagesBasePath.resolve(sha256).exists()
     }
 }

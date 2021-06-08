@@ -11,19 +11,51 @@ data class User(
     val name: String,
     val displayName: String,
     val position: String,
-    val photo: Boolean?,
+    val photo: String?,
     val github: String?,
     val qq: String?,
     val weChat: String?,
     @JsonIgnore
     var lastSyncFailed: Boolean
-)
+) {
+    class Builder constructor(
+        user: User
+    ) {
+        var displayId: String = user.displayId
+        var name: String = user.name
+        var displayName: String = user.displayName
+        var position: String = user.position
+        var photo: String? = user.photo
+        var github: String? = user.github
+        var qq: String? = user.qq
+        var weChat: String? = user.weChat
+        var lastSyncFailed: Boolean = user.lastSyncFailed
+    }
+
+    constructor(builder: Builder) : this(
+        builder.displayId,
+        builder.name,
+        builder.displayName,
+        builder.position,
+        builder.photo,
+        builder.github,
+        builder.qq,
+        builder.weChat,
+        builder.lastSyncFailed
+    )
+
+    inline fun copyBuilder(builderHandler: Builder.() -> Unit): User {
+        val builder = Builder(this)
+        builderHandler(builder)
+        return User(builder)
+    }
+}
 
 data class Message(
     val id: Long,
     val content: String,
     val timestamp: Int,
-    val image: Boolean?,
+    val image: String?,
     val author: User,
 )
 

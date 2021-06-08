@@ -14,9 +14,12 @@ import io.ktor.http.content.*
 import io.ktor.response.*
 import io.ktor.sessions.*
 import io.ktor.websocket.*
+import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.apache.tika.Tika
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
 import tem.csdn.dao.Messages
@@ -59,10 +62,12 @@ fun Application.module() {
             call.respond(HttpStatusCode.BadRequest, param.message ?: param.parameterName)
         }
         exception<ResultException> { resultException ->
+            log.error("result error:${resultException.result}", resultException)
             call.respond(resultException.result)
         }
-        exception<FileNotFoundException> { nouFound ->
-            call.respond(HttpStatusCode.NotFound, nouFound.message ?: "")
+        exception<FileNotFoundException> { notFound ->
+            log.info("404 -> ${notFound.message}")
+            call.respond(HttpStatusCode.NotFound, notFound.message ?: "")
         }
     }
     install(Sessions) {
@@ -71,153 +76,11 @@ fun Application.module() {
 
 
     val objectMapper = jacksonObjectMapper()
+    val tika = Tika()
 
     routing {
         val sessions = ConcurrentHashMap<String, Pair<User, DefaultWebSocketSession>>()
         val displayIdSessions = ConcurrentHashMap<String, Pair<User, DefaultWebSocketSession>>()
-        get("/img/{method}/{id}") {
-            // if photo then id is User.DisplayId else if image then id is Message.Id
-            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
-            val id = call.parameters["id"]!!
-            when (call.parameters["method"]!!) {
-                "photo" -> {
-                    call.respondOutputStream {
-                        resources.get(Resources.ResourcesType.PHOTO, id).transferTo(this)
-                    }
-                }
-                "image" -> {
-                    call.respondOutputStream {
-                        resources.get(Resources.ResourcesType.IMAGE, id).transferTo(this)
-                    }
-                }
-                "chat" -> {
-                    call.respondOutputStream {
-                        resources.get(Resources.ResourcesType.CHAT, 0).transferTo(this)
-                    }
-                }
-            }
-        }
-        post("/photo") {
-            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
-            val multipart = call.receiveMultipart()
-            multipart.forEachPart { partData ->
-                if (partData is PartData.FileItem) {
-                    resources.save(Resources.ResourcesType.PHOTO, user.displayId, partData.streamProvider())
-                    transaction {
-                        Users.update({ Users.displayId eq user.displayId }) {
-                            it[photo] = true
-                        }
-                    }
-                    return@forEachPart
-                }
-            }
-        }
-        get("/messages") {
-            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
-            val parameters = call.request.queryParameters
-            val after = parameters["after"]?.toLongOrNull()
-            val afterId = parameters["after_id"]?.toLongOrNull()
-            val messages = if (after == null && afterId == null) {
-                val currentTime = LocalDate.now().plusDays(-7).toEpochSecond(LocalTime.MIN, OffsetDateTime.now().offset)
-                transaction {
-                    (Messages leftJoin Users).select {
-                        Messages.timestamp greaterEq currentTime
-                    }.map { it.toMessage() }
-                }
-            } else {
-                transaction {
-                    (Messages leftJoin Users).select {
-                        if (after != null) {
-                            Messages.timestamp greaterEq after
-                        } else {
-                            Messages.id greater afterId!!
-                        }
-                    }.map { it.toMessage() }
-                }
-            }
-            if (user.lastSyncFailed) {
-                transaction {
-                    Users.update({ Users.displayId eq user.displayId }) {
-                        it[lastSyncFail] = false
-                    }
-                }
-            }
-            call.respond(Result(0, null, messages))
-        }
-        get("/profiles") {
-            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
-            val profiles =
-                transaction {
-                    Users.selectAll()// { (Users.id inList sessions.keys().toList()) and (Users.displayId neq user.displayId) }
-                        .map { it.toUser() }
-                }
-            call.respond(Result(0, null, profiles))
-        }
-        post("/profile") {
-            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
-            val parameters = call.receiveParameters()
-            transaction {
-                Users.update({ Users.displayId eq user.displayId }) {
-                    parameters["name"]?.let { name ->
-                        it[Users.name] = name
-                    }
-                    parameters["displayName"]?.let { displayName ->
-                        it[Users.displayName] = displayName
-                    }
-                    parameters["position"]?.let { position ->
-                        it[Users.position] = position
-                    }
-                    parameters["github"]?.let { github ->
-                        it[Users.github] = github
-                    }
-                    parameters["qq"]?.let { qq ->
-                        it[Users.qq] = qq
-                    }
-                    parameters["weChat"]?.let { weChat ->
-                        it[Users.weChat] = weChat
-                    }
-                }
-            }
-        }
-        get("/chat_name") {
-            call.respond(Result(0, null, chatDisplayName))
-        }
-        get("/count") {
-            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
-            if (displayIdSessions.containsKey(user.displayId)) {
-                call.respond(Result(0, null, sessions.size))
-            } else {
-                call.respond(Result(0, null, sessions.size + 1))
-            }
-        }
-        post("/csdnchat/{id}") {
-            val id = call.parameters["id"]!!
-            val userResultRow =
-                transaction { Users.select { Users.id eq id }.singleOrNull() }
-            val user = if (userResultRow != null) {
-                userResultRow.toUser()
-            } else {
-                val displayId = UUID.randomUUID().toString()
-                val name = "用户${('a'..'z').randomString(6)}"
-                transaction {
-                    Users.insert {
-                        it[this.displayId] = displayId
-                        it[this.id] = id
-                        it[this.name] = name
-                        it[this.displayName] = name
-                        it[this.position] = ""
-                        it[this.photo] = false
-                        it[this.github] = null
-                        it[this.qq] = null
-                        it[this.weChat] = null
-                        it[this.lastSyncFail] = false
-                    }
-                }
-                User(displayId, name, name, "", false, null, null, null, false)
-            }
-            call.sessions.set(LoginSession(user))
-            call.respond(Result(0, null, user))
-        }
 
         suspend fun DefaultWebSocketSession.sendRetry(frame: Frame, cnt: Int = 3): Boolean {
             if (cnt == 0) {
@@ -279,7 +142,7 @@ fun Application.module() {
                     if (sessionPair.second != this) {
                         sessionPair.trySendSync(id, wrapper)
                     }
-                }else{
+                } else {
                     (sessionPair.second as DefaultWebSocketServerSession).sendRetry(
                         Frame.Text(
                             objectMapper.writeValueAsString(
@@ -289,6 +152,189 @@ fun Application.module() {
                     )
                 }
             }
+        }
+
+        get("/image/{sha256}") {
+            // if photo then id is User.DisplayId else if image then id is Message.Id
+            call.sessions.get<LoginSession>()?.currentUser
+                ?: call.request.header("auth-uuid")?.let {
+                    transaction { Users.select { Users.id eq it }.singleOrNull() }
+                }?.toUser() ?: Result.NOT_LOGIN.throwOut()
+            val sha256 = call.parameters["sha256"]!!
+            call.respondOutputStream(
+                ContentType.parse(
+                    resources.get(sha256).use { tika.detect(it) })
+            ) {
+                resources.get(sha256).transferTo(this)
+            }
+        }
+        get("/upc/{sha256}") {
+            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            val sha256 = call.parameters["sha256"]!!
+            call.respond(Result(0, null, resources.exists(sha256)))
+        }
+        post("/photo") {
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            val multipart = call.receiveMultipart()
+            val newUser = user.copyBuilder {
+                multipart.forEachPart { partData ->
+                    if (partData is PartData.FileItem) {
+                        transaction {
+                            resources.save(partData.streamProvider()).`try` { sha256 ->
+                                Users.update({ Users.displayId eq user.displayId }) {
+                                    it[photo] = sha256
+                                }
+                                this@copyBuilder.photo = sha256
+                            }
+                        }
+                        return@forEachPart
+                    }
+                }
+            }
+            call.sessions.set(LoginSession(newUser))
+            GlobalScope.launch {
+                for (displayIdSession in displayIdSessions) {
+                    if (displayIdSession.key == user.displayId) {
+                        displayIdSession.value.second.sendToOther(
+                            WebSocketFrameWrapper(
+                                WebSocketFrameWrapper.FrameType.UPDATE_USER,
+                                newUser
+                            )
+                        )
+                        break
+                    }
+                }
+            }
+            call.respond(Result(0, null, newUser))
+        }
+        get("/messages") {
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            val parameters = call.request.queryParameters
+            val after = parameters["after"]?.toLongOrNull()
+            val afterId = parameters["after_id"]?.toLongOrNull()
+            val messages = if (after == null && afterId == null) {
+                val currentTime = LocalDate.now().plusDays(-7).toEpochSecond(LocalTime.MIN, OffsetDateTime.now().offset)
+                transaction {
+                    (Messages leftJoin Users).select {
+                        Messages.timestamp greaterEq currentTime
+                    }.map { it.toMessage() }
+                }
+            } else {
+                transaction {
+                    (Messages leftJoin Users).select {
+                        if (after != null) {
+                            Messages.timestamp greaterEq after
+                        } else {
+                            Messages.id greater afterId!!
+                        }
+                    }.map { it.toMessage() }
+                }
+            }
+            if (user.lastSyncFailed) {
+                transaction {
+                    Users.update({ Users.displayId eq user.displayId }) {
+                        it[lastSyncFail] = false
+                    }
+                }
+            }
+            call.respond(Result(0, null, messages))
+        }
+        get("/profiles") {
+            call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            val profiles =
+                transaction {
+                    Users.selectAll()// { (Users.id inList sessions.keys().toList()) and (Users.displayId neq user.displayId) }
+                        .map { it.toUser() }
+                }
+            call.respond(Result(0, null, profiles))
+        }
+        post("/profile") {
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            val parameters = call.receiveParameters()
+            val newUser = user.copyBuilder {
+                transaction {
+                    Users.update({ Users.displayId eq user.displayId }) {
+                        parameters["name"]?.let { name ->
+                            it[Users.name] = name
+                            this@copyBuilder.name = name
+                        }
+                        parameters["displayName"]?.let { displayName ->
+                            it[Users.displayName] = displayName
+                            this@copyBuilder.displayName = displayName
+                        }
+                        parameters["position"]?.let { position ->
+                            it[Users.position] = position
+                            this@copyBuilder.position = position
+                        }
+                        parameters["github"]?.let { github ->
+                            it[Users.github] = github
+                            this@copyBuilder.github = github
+                        }
+                        parameters["qq"]?.let { qq ->
+                            it[Users.qq] = qq
+                            this@copyBuilder.qq = qq
+                        }
+                        parameters["weChat"]?.let { weChat ->
+                            it[Users.weChat] = weChat
+                            this@copyBuilder.weChat = weChat
+                        }
+                    }
+                }
+            }
+            call.sessions.set(LoginSession(newUser))
+            GlobalScope.launch {
+                for (displayIdSession in displayIdSessions) {
+                    if (displayIdSession.key == user.displayId) {
+                        displayIdSession.value.second.sendToOther(
+                            WebSocketFrameWrapper(
+                                WebSocketFrameWrapper.FrameType.UPDATE_USER,
+                                newUser
+                            )
+                        )
+                        break
+                    }
+                }
+            }
+            call.respond(Result(0, null, newUser))
+        }
+        get("/chat_name") {
+            call.respond(Result(0, null, chatDisplayName))
+        }
+        get("/count") {
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            if (displayIdSessions.containsKey(user.displayId)) {
+                call.respond(Result(0, null, sessions.size))
+            } else {
+                call.respond(Result(0, null, sessions.size + 1))
+            }
+        }
+        post("/csdnchat/{id}") {
+            val id = call.parameters["id"]!!
+            val userResultRow =
+                transaction { Users.select { Users.id eq id }.singleOrNull() }
+            val user = if (userResultRow != null) {
+                userResultRow.toUser()
+            } else {
+                val displayId = UUID.randomUUID().toString()
+                val name = "用户${('a'..'z').randomString(6)}"
+                transaction {
+                    Users.insert {
+                        it[this.displayId] = displayId
+                        it[this.id] = id
+                        it[this.name] = name
+                        it[this.displayName] = name
+                        it[this.position] = ""
+                        it[this.github] = null
+                        it[this.photo] = null
+                        it[this.qq] = null
+                        it[this.weChat] = null
+                        it[this.lastSyncFail] = false
+                    }
+                }
+                User(displayId, name, name, "", null, null, null, null, false)
+            }
+            call.sessions.set(LoginSession(user))
+            call.respond(Result(0, null, user))
         }
 
         webSocket("/csdnchat/{id}") {
@@ -319,7 +365,7 @@ fun Application.module() {
             }
             var lastHeartBeatUUIDString: String? = null
             val heartBeatJob = launch {
-                while (true) {
+                while (isActive) {
                     if (lastHeartBeatUUIDString != null) {
                         val exp = HeartBeatException.HeartBeatTimeoutException()
                         close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, exp.toString()))
@@ -348,20 +394,21 @@ fun Application.module() {
 //            }
             try {
                 for (frame in incoming) {
+                    log.info("new frame is coming:${frame.frameType}")
                     when (frame) {
                         is Frame.Text -> {
                             try {
                                 val receivedText = frame.readText()
                                 val node = objectMapper.readValue<WebSocketFrameWrapper>(receivedText)
                                 when (node.type) {
-                                    WebSocketFrameWrapper.FrameType.MESSAGE -> {
+                                    WebSocketFrameWrapper.FrameType.TEXT_MESSAGE -> {
                                         val content = node.content
                                         if (content != null) {
                                             val contentString = objectMapper.convertValue<String>(content)
                                             val message = transaction {
                                                 val row = Messages.insert {
                                                     it[author] = user.displayId
-                                                    it[image] = false
+                                                    it[image] = null
                                                     it[Messages.content] = contentString
                                                     it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
                                                 }
@@ -370,7 +417,30 @@ fun Application.module() {
                                             launch {
                                                 sendToAll(
                                                     WebSocketFrameWrapper(
-                                                        WebSocketFrameWrapper.FrameType.MESSAGE,
+                                                        WebSocketFrameWrapper.FrameType.TEXT_MESSAGE,
+                                                        message
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
+                                    WebSocketFrameWrapper.FrameType.IMAGE_MESSAGE -> {
+                                        val content = node.content
+                                        if (content != null) {
+                                            val sha256 = objectMapper.convertValue<String>(content)
+                                            val message = transaction {
+                                                val row = Messages.insert {
+                                                    it[author] = user.displayId
+                                                    it[Messages.content] = ""
+                                                    it[image] = sha256
+                                                    it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                                                }
+                                                row.resultedValues!!.single().toMessage(user)
+                                            }
+                                            launch {
+                                                sendToAll(
+                                                    WebSocketFrameWrapper(
+                                                        WebSocketFrameWrapper.FrameType.IMAGE_MESSAGE,
                                                         message
                                                     )
                                                 )
@@ -416,20 +486,20 @@ fun Application.module() {
                             try {
                                 val receivedBytes = frame.readBytes()
                                 val message = transaction {
-                                    val row = Messages.insert {
-                                        it[author] = user.displayId
-                                        it[image] = true
-                                        it[content] = ""
-                                        it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
-                                    }
-                                    row.resultedValues!!.single().toMessage(user).apply {
-                                        resources.save(Resources.ResourcesType.IMAGE, this.id, receivedBytes)
+                                    resources.save(receivedBytes).`try` { sha256 ->
+                                        val row = Messages.insert {
+                                            it[author] = user.displayId
+                                            it[image] = sha256
+                                            it[content] = ""
+                                            it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                                        }
+                                        row.resultedValues!!.single().toMessage(user)
                                     }
                                 }
                                 launch {
                                     sendToAll(
                                         WebSocketFrameWrapper(
-                                            WebSocketFrameWrapper.FrameType.MESSAGE,
+                                            WebSocketFrameWrapper.FrameType.TEXT_MESSAGE,
                                             message
                                         )
                                     )

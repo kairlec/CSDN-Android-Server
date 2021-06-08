@@ -21,7 +21,7 @@ object Users : Table() {
     val name = varchar("name", 50)
     val displayName = varchar("display_name", 50)
     val position = varchar("position", 50)
-    val photo = bool("image").nullable().default(false)
+    val photo = varchar("image", 64).nullable().default(null)
     val github = varchar("github", 256).nullable()
     val qq = varchar("qq", 20).nullable()
     val weChat = varchar("wechat", 30).nullable()
@@ -34,7 +34,7 @@ object Messages : Table() {
     val id = long("id").autoIncrement()
     val content = varchar("content", 1024)
     val timestamp = integer("timestamp")
-    val image = bool("image").nullable().default(false)
+    val image = varchar("image", 64).nullable().default(null)
     val author = varchar("user_id", 36) references Users.displayId
 
     override val primaryKey = PrimaryKey(id)

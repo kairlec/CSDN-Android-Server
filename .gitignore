@@ -33,3 +33,5 @@ hs_err_pid*
 
 target/
 data/
+src/test/kotlin/Test.kt
+start.bat

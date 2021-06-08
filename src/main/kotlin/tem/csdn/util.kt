@@ -1,5 +1,6 @@
 package tem.csdn
 
+import java.security.MessageDigest
 import kotlin.random.Random
 
 fun CharRange.randomString(length: Int) = (1..length).map { randomChar }.joinToString("")
@@ -11,9 +12,12 @@ fun CharRange.Companion.randomString(length: Int, vararg ranges: CharRange): Str
     return (1..length).map { ranges[(Random.nextInt(ranges.size))].randomChar }.joinToString("")
 }
 
-fun String.Companion.byteArrayAsHex(byteArray: ByteArray): String {
-    return StringBuilder(byteArray.size * 2).let { builder ->
-        byteArray.forEach { builder.append("%02X".format(it)) }
-        builder.toString()
-    }
+fun CharRange.Companion.randomString(length: Int, ranges: List<CharRange>): String {
+    return (1..length).map { ranges[(Random.nextInt(ranges.size))].randomChar }.joinToString("")
 }
+
+fun List<CharRange>.randomChar(length: Int) = CharRange.randomString(length, this)
+
+fun ByteArray.toHexString() = joinToString("") { "%02x".format(it) }
+
+fun ByteArray.sha256() = MessageDigest.getInstance("SHA-256").digest(this).toHexString()
