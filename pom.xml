@@ -57,6 +57,26 @@
                 <groupId>org.jetbrains.kotlin</groupId>
                 <artifactId>kotlin-maven-plugin</artifactId>
                 <version>${kotlin.version}</version>
+                <configuration>
+                    <compilerPlugins>
+                        <!-- Or "jpa" for JPA support -->
+                        <plugin>no-arg</plugin>
+                    </compilerPlugins>
+
+                    <pluginOptions>
+                        <option>no-arg:annotation=tem.csdn.NoArg</option>
+                        <!-- Call instance initializers in the synthetic constructor -->
+                        <!-- <option>no-arg:invokeInitializers=true</option> -->
+                    </pluginOptions>
+                </configuration>
+
+                <dependencies>
+                    <dependency>
+                        <groupId>org.jetbrains.kotlin</groupId>
+                        <artifactId>kotlin-maven-noarg</artifactId>
+                        <version>${kotlin.version}</version>
+                    </dependency>
+                </dependencies>
                 <executions>
                     <execution>
                         <id>compile</id>
@@ -65,6 +85,9 @@
                             <goal>compile</goal>
                         </goals>
                         <configuration>
+                            <args>
+                                <arg>-Xuse-14-inline-classes-mangling-scheme</arg>
+                            </args>
                             <experimentalCoroutines>enable</experimentalCoroutines>
                         </configuration>
                     </execution>
@@ -75,6 +98,9 @@
                             <goal>test-compile</goal>
                         </goals>
                         <configuration>
+                            <args>
+                                <arg>-Xuse-14-inline-classes-mangling-scheme</arg>
+                            </args>
                             <experimentalCoroutines>enable</experimentalCoroutines>
                         </configuration>
                     </execution>
@@ -117,6 +143,7 @@
                     </execution>
                 </executions>
             </plugin>
+
         </plugins>
     </build>
 

@@ -3,6 +3,7 @@ package tem.csdn.dao
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
+import tem.csdn.model.MessageType
 import java.sql.Connection
 
 fun connectToFile(file: String) {
@@ -32,9 +33,10 @@ object Users : Table() {
 
 object Messages : Table() {
     val id = long("id").autoIncrement()
+    val clientId = varchar("client_id", 36).uniqueIndex()
     val content = varchar("content", 1024)
     val timestamp = integer("timestamp")
-    val image = varchar("image", 64).nullable().default(null)
+    val type = enumeration("type", MessageType::class)
     val author = varchar("user_id", 36) references Users.displayId
 
     override val primaryKey = PrimaryKey(id)

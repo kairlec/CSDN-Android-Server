@@ -2,10 +2,11 @@ package tem.csdn.model
 
 import com.fasterxml.jackson.annotation.JsonIgnore
 import org.jetbrains.exposed.sql.ResultRow
+import tem.csdn.NoArg
 import tem.csdn.dao.Messages
 import tem.csdn.dao.Users
 
-
+@NoArg
 data class User(
     val displayId: String,
     val name: String,
@@ -51,13 +52,6 @@ data class User(
     }
 }
 
-data class Message(
-    val id: Long,
-    val content: String,
-    val timestamp: Int,
-    val image: String?,
-    val author: User,
-)
 
 fun ResultRow.toUser(): User {
     return User(
@@ -74,22 +68,24 @@ fun ResultRow.toUser(): User {
 }
 
 fun ResultRow.toMessage(): Message {
-    return Message(
+    return newMessage(
         this[Messages.id],
+        ClientId(this[Messages.clientId]),
         this[Messages.content],
         this[Messages.timestamp],
-        this[Messages.image],
         this.toUser(),
+        this[Messages.type],
     )
 }
 
 fun ResultRow.toMessage(user: User): Message {
-    return Message(
+    return newMessage(
         this[Messages.id],
+        ClientId(this[Messages.clientId]),
         this[Messages.content],
         this[Messages.timestamp],
-        this[Messages.image],
         user,
+        this[Messages.type],
     )
 }
 

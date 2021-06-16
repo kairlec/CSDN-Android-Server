@@ -1,5 +1,6 @@
 package tem.csdn
 
+import tem.csdn.model.BinaryContent
 import java.io.FileNotFoundException
 import java.io.InputStream
 import java.nio.file.Files
@@ -22,16 +23,16 @@ class ResourcesSaveResult(
 
 class Resources(basePath: Path) {
     companion object {
-        const val DIR_NAME = "images"
+        const val DIR_NAME = "res"
     }
 
-    private val imagesBasePath = basePath.resolve(DIR_NAME)
+    private val binaryFileBasePath = basePath.resolve(DIR_NAME)
 
     constructor(basePath: String) : this(Path.of(basePath))
 
     init {
-        if (imagesBasePath.notExists()) {
-            Files.createDirectories(imagesBasePath)
+        if (binaryFileBasePath.notExists()) {
+            Files.createDirectories(binaryFileBasePath)
         }
     }
 
@@ -41,13 +42,24 @@ class Resources(basePath: Path) {
 
     fun save(data: ByteArray): ResourcesSaveResult {
         val sha256 = data.sha256()
-        val path = imagesBasePath.resolve(sha256)
+        val path = binaryFileBasePath.resolve(sha256)
         Files.write(path, data)
         return ResourcesSaveResult(sha256, path)
     }
 
+    fun save(binaryContents: List<BinaryContent>): ResourcesSaveResult {
+        val sha256 = binaryContents.sha256()
+        val path = binaryFileBasePath.resolve(sha256)
+        Files.newOutputStream(path).use {
+            binaryContents.forEachContent { bytes: ByteArray, offset: Int, length: Int ->
+                it.write(bytes, offset, length)
+            }
+        }
+        return ResourcesSaveResult(sha256, path)
+    }
+
     fun get(sha256: String): InputStream {
-        return imagesBasePath.resolve(sha256).let {
+        return binaryFileBasePath.resolve(sha256).let {
             if (it.notExists()) {
                 throw FileNotFoundException(it.toString())
             } else {
@@ -57,6 +69,6 @@ class Resources(basePath: Path) {
     }
 
     fun exists(sha256: String): Boolean {
-        return imagesBasePath.resolve(sha256).exists()
+        return binaryFileBasePath.resolve(sha256).exists()
     }
 }

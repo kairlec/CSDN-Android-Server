@@ -1,5 +1,6 @@
 package tem.csdn
 
+import com.fasterxml.jackson.databind.module.SimpleModule
 import com.fasterxml.jackson.module.kotlin.convertValue
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
@@ -25,8 +26,11 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import tem.csdn.dao.Messages
 import tem.csdn.dao.Users
 import tem.csdn.dao.connectToFile
+import tem.csdn.intf.TextFrameActionConvertable
 import tem.csdn.model.*
 import tem.csdn.model.Result.Companion.ID_MULTI_ERROR
+import tem.csdn.util.ClientIdDeserializer
+import tem.csdn.util.ClientIdSerializer
 import java.io.FileNotFoundException
 import java.time.Duration
 import java.time.LocalDate
@@ -76,6 +80,10 @@ fun Application.module() {
 
 
     val objectMapper = jacksonObjectMapper()
+    objectMapper.registerModule(SimpleModule().apply {
+        addDeserializer(ClientId::class.java, ClientIdDeserializer())
+        addSerializer(ClientId::class.java, ClientIdSerializer())
+    })
     val tika = Tika()
 
     routing {
@@ -98,7 +106,7 @@ fun Application.module() {
             }
         }
 
-        suspend fun Pair<User, DefaultWebSocketSession>.trySendSync(id: String, wrapper: WebSocketFrameWrapper) {
+        suspend fun Pair<User, DefaultWebSocketSession>.trySendSync(id: String, wrapper: TextFrameAction) {
             if (!this.second.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
                 log.error("send msg to id[${id}] has failed")
                 transaction {
@@ -110,7 +118,7 @@ fun Application.module() {
             }
         }
 
-        suspend fun DefaultWebSocketSession.sendToAll(wrapper: WebSocketFrameWrapper) {
+        suspend fun DefaultWebSocketSession.sendToAll(wrapper: TextFrameAction) {
             log.info("(all)a new ${wrapper.type.name} event to send")
             sessions.forEach { (id, sessionPair) ->
                 // 给自己也发,代表ack
@@ -120,7 +128,7 @@ fun Application.module() {
                     (sessionPair.second as DefaultWebSocketServerSession).sendRetry(
                         Frame.Text(
                             objectMapper.writeValueAsString(
-                                WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.NEED_SYNC, null)
+                                TextFrameAction(TextFrameActionType.ACTION_NEED_SYNC, "")
                             )
                         )
                     )
@@ -128,14 +136,14 @@ fun Application.module() {
             }
         }
 
-        suspend fun DefaultWebSocketSession.sendToSelf(wrapper: WebSocketFrameWrapper) {
+        suspend fun DefaultWebSocketSession.sendToSelf(wrapper: TextFrameAction) {
             log.info("(self)a new ${wrapper.type.name} event to send")
             if (!this.sendRetry(Frame.Text(objectMapper.writeValueAsString(wrapper)))) {
                 log.error("send msg to self has failed")
             }
         }
 
-        suspend fun DefaultWebSocketSession.sendToOther(wrapper: WebSocketFrameWrapper) {
+        suspend fun DefaultWebSocketSession.sendToOther(wrapper: TextFrameAction) {
             log.info("(other)a new ${wrapper.type.name} event to send")
             sessions.forEach { (id, sessionPair) ->
                 if (!sessionPair.first.lastSyncFailed) {
@@ -146,7 +154,7 @@ fun Application.module() {
                     (sessionPair.second as DefaultWebSocketServerSession).sendRetry(
                         Frame.Text(
                             objectMapper.writeValueAsString(
-                                WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.NEED_SYNC, null)
+                                TextFrameAction(TextFrameActionType.ACTION_NEED_SYNC, "")
                             )
                         )
                     )
@@ -156,10 +164,10 @@ fun Application.module() {
 
         get("/image/{sha256}") {
             // if photo then id is User.DisplayId else if image then id is Message.Id
-            call.sessions.get<LoginSession>()?.currentUser
-                ?: call.request.header("auth-uuid")?.let {
-                    transaction { Users.select { Users.id eq it }.singleOrNull() }
-                }?.toUser() ?: Result.NOT_LOGIN.throwOut()
+//            call.sessions.get<LoginSession>()?.currentUser
+//                ?: call.request.header("auth-uuid")?.let {
+//                    transaction { Users.select { Users.id eq it }.singleOrNull() }
+//                }?.toUser() ?: Result.NOT_LOGIN.throwOut()
             val sha256 = call.parameters["sha256"]!!
             call.respondOutputStream(
                 ContentType.parse(
@@ -196,8 +204,8 @@ fun Application.module() {
                 for (displayIdSession in displayIdSessions) {
                     if (displayIdSession.key == user.displayId) {
                         displayIdSession.value.second.sendToOther(
-                            WebSocketFrameWrapper(
-                                WebSocketFrameWrapper.FrameType.UPDATE_USER,
+                            TextFrameAction(
+                                TextFrameActionType.ACTION_UPDATE_USER,
                                 newUser
                             )
                         )
@@ -286,8 +294,8 @@ fun Application.module() {
                 for (displayIdSession in displayIdSessions) {
                     if (displayIdSession.key == user.displayId) {
                         displayIdSession.value.second.sendToOther(
-                            WebSocketFrameWrapper(
-                                WebSocketFrameWrapper.FrameType.UPDATE_USER,
+                            TextFrameAction(
+                                TextFrameActionType.ACTION_UPDATE_USER,
                                 newUser
                             )
                         )
@@ -351,8 +359,8 @@ fun Application.module() {
             displayIdSessions[user.displayId] = sessionPair
             launch {
                 sendToAll(
-                    WebSocketFrameWrapper(
-                        WebSocketFrameWrapper.FrameType.NEW_CONNECTION,
+                    TextFrameAction(
+                        TextFrameActionType.ACTION_NEW_CONNECTION,
                         user
                     )
                 )
@@ -360,7 +368,7 @@ fun Application.module() {
             // 上次有同步失败的,发送强制同步信息
             if (user.lastSyncFailed) {
                 sendToSelf(
-                    WebSocketFrameWrapper(WebSocketFrameWrapper.FrameType.NEED_SYNC, null)
+                    TextFrameAction(TextFrameActionType.ACTION_NEED_SYNC, "")
                 )
             }
             var lastHeartBeatUUIDString: String? = null
@@ -375,9 +383,9 @@ fun Application.module() {
                     (this@webSocket as DefaultWebSocketSession).sendRetry(
                         Frame.Text(
                             objectMapper.writeValueAsString(
-                                WebSocketFrameWrapper(
-                                    WebSocketFrameWrapper.FrameType.HEARTBEAT,
-                                    lastHeartBeatUUIDString
+                                TextFrameAction(
+                                    TextFrameActionType.ACTION_HEARTBEAT,
+                                    lastHeartBeatUUIDString!!
                                 )
                             )
                         )
@@ -399,110 +407,91 @@ fun Application.module() {
                         is Frame.Text -> {
                             try {
                                 val receivedText = frame.readText()
-                                val node = objectMapper.readValue<WebSocketFrameWrapper>(receivedText)
+                                val node = objectMapper.readValue<TextFrameAction>(receivedText)
                                 when (node.type) {
-                                    WebSocketFrameWrapper.FrameType.TEXT_MESSAGE -> {
-                                        val content = node.content
-                                        if (content != null) {
-                                            val contentString = objectMapper.convertValue<String>(content)
-                                            val message = transaction {
-                                                val row = Messages.insert {
-                                                    it[author] = user.displayId
-                                                    it[image] = null
-                                                    it[Messages.content] = contentString
-                                                    it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
-                                                }
-                                                row.resultedValues!!.single().toMessage(user)
+                                    TextFrameActionType.ACTION_MESSAGE -> {
+                                        val receiveMessage =
+                                            newMessageFromJson(objectMapper.convertValue(node.content), objectMapper)
+                                        val message = transaction {
+                                            val row = Messages.insert {
+                                                it[author] = user.displayId
+                                                it[content] = receiveMessage.content
+                                                it[type] = receiveMessage.type
+                                                it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
                                             }
-                                            launch {
-                                                sendToAll(
-                                                    WebSocketFrameWrapper(
-                                                        WebSocketFrameWrapper.FrameType.TEXT_MESSAGE,
-                                                        message
-                                                    )
-                                                )
-                                            }
+                                            row.resultedValues!!.single().toMessage(user)
                                         }
-                                    }
-                                    WebSocketFrameWrapper.FrameType.IMAGE_MESSAGE -> {
-                                        val content = node.content
-                                        if (content != null) {
-                                            val sha256 = objectMapper.convertValue<String>(content)
-                                            val message = transaction {
-                                                val row = Messages.insert {
-                                                    it[author] = user.displayId
-                                                    it[Messages.content] = ""
-                                                    it[image] = sha256
-                                                    it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
-                                                }
-                                                row.resultedValues!!.single().toMessage(user)
-                                            }
-                                            launch {
-                                                sendToAll(
-                                                    WebSocketFrameWrapper(
-                                                        WebSocketFrameWrapper.FrameType.IMAGE_MESSAGE,
-                                                        message
-                                                    )
-                                                )
-                                            }
-                                        }
-                                    }
-                                    // 收到心跳包,发送心跳回包
-                                    WebSocketFrameWrapper.FrameType.HEARTBEAT -> {
-                                        val content = node.content
-                                        if (content != null) {
-                                            val contentString = objectMapper.convertValue<String>(content)
-                                            sendToSelf(
-                                                WebSocketFrameWrapper(
-                                                    WebSocketFrameWrapper.FrameType.HEARTBEAT_ACK,
-                                                    contentString
+                                        launch {
+                                            sendToAll(
+                                                TextFrameAction(
+                                                    TextFrameActionType.ACTION_MESSAGE,
+                                                    message
                                                 )
                                             )
                                         }
                                     }
-                                    // 收到心跳回包
-                                    WebSocketFrameWrapper.FrameType.HEARTBEAT_ACK -> {
-                                        val content = node.content
-                                        if (content != null) {
-                                            val contentString = objectMapper.convertValue<String>(content)
-                                            //心跳回包内容异常,断开连接
-                                            if (contentString != lastHeartBeatUUIDString) {
-                                                val exp = HeartBeatException.HeartBeatContentMismatchException(
-                                                    lastHeartBeatUUIDString ?: "null",
-                                                    contentString
-                                                )
-                                                close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, exp.toString()))
-                                            }
-                                            lastHeartBeatUUIDString = null
-                                        }
+                                    TextFrameActionType.ACTION_HEARTBEAT -> {
+                                        val contentString = objectMapper.convertValue<String>(node.content)
+                                        sendToSelf(
+                                            TextFrameAction(
+                                                TextFrameActionType.ACTION_HEARTBEAT_ACK,
+                                                contentString
+                                            )
+                                        )
                                     }
-                                    else -> continue
+                                    TextFrameActionType.ACTION_HEARTBEAT_ACK -> {
+                                        val contentString = objectMapper.convertValue<String>(node.content)
+                                        //心跳回包内容异常,断开连接
+                                        if (contentString != lastHeartBeatUUIDString) {
+                                            val exp = HeartBeatException.HeartBeatContentMismatchException(
+                                                lastHeartBeatUUIDString ?: "null",
+                                                contentString
+                                            )
+                                            close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, exp.toString()))
+                                        }
+                                        lastHeartBeatUUIDString = null
+                                    }
+                                    TextFrameActionType.ACTION_UPDATE_USER -> TODO("服务端无需处理,客户端不会发送")
+                                    TextFrameActionType.ACTION_NEW_CONNECTION -> TODO("服务端无需处理,客户端不会发送")
+                                    TextFrameActionType.ACTION_NEW_DISCONNECTION -> TODO("服务端无需处理,客户端不会发送")
+                                    TextFrameActionType.ACTION_NEED_SYNC -> TODO("服务端无需处理,客户端不会发送")
+                                    TextFrameActionType.ACTION_BINARY_RANGE_MISSING -> TODO("服务端无需处理,客户端不会发送")
+                                    TextFrameActionType.ACTION_BINARY_HEAD_MISSING -> TODO("服务端无需处理,客户端不会发送")
                                 }
                             } catch (e: Throwable) {
                                 log.warn("wrong text format:${e.message}")
+                                if (e is TextFrameActionConvertable) {
+                                    val action = e.toTextFrameAction()
+                                    sendToSelf(action)
+                                }
                             }
                         }
                         is Frame.Binary -> {
                             try {
                                 val receivedBytes = frame.readBytes()
-                                val message = transaction {
-                                    resources.save(receivedBytes).`try` { sha256 ->
+                                val binaryFrames = BinaryFrames.parse(receivedBytes)
+                                RawBinaryMessageBuildHelper.append(binaryFrames)
+                                if (binaryFrames is BinaryFrames.BinaryTailFrame) {
+                                    val message = transaction {
+                                        val msg = RawBinaryMessageBuildHelper.build(binaryFrames.clientId)
+                                        val result = msg.save(resources)
                                         val row = Messages.insert {
                                             it[author] = user.displayId
-                                            it[image] = sha256
-                                            it[content] = ""
+                                            it[clientId] = msg.clientId.value
                                             it[timestamp] = (System.currentTimeMillis() / 1000).toInt()
+                                            it[type] = msg.type
+                                            it[content] = msg.getContent(result.sha256)
                                         }
                                         row.resultedValues!!.single().toMessage(user)
                                     }
-                                }
-                                launch {
-                                    sendToAll(
-                                        WebSocketFrameWrapper(
-                                            WebSocketFrameWrapper.FrameType.TEXT_MESSAGE,
-                                            message
+                                    launch {
+                                        sendToAll(
+                                            TextFrameAction(
+                                                TextFrameActionType.ACTION_MESSAGE,
+                                                message
+                                            )
                                         )
-                                    )
+                                    }
                                 }
                             } catch (e: Throwable) {
                                 log.warn("wrong binary format:${e.message}")
@@ -521,8 +510,8 @@ fun Application.module() {
                 heartBeatJob.cancel()
                 launch {
                     sendToOther(
-                        WebSocketFrameWrapper(
-                            WebSocketFrameWrapper.FrameType.NEW_DISCONNECTION,
+                        TextFrameAction(
+                            TextFrameActionType.ACTION_NEW_DISCONNECTION,
                             user
                         )
                     )
