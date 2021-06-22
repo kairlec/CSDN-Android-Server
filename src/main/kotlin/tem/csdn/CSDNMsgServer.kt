@@ -156,10 +156,10 @@ fun Application.module() {
 
         get("/image/{sha256}") {
             // if photo then id is User.DisplayId else if image then id is Message.Id
-            call.sessions.get<LoginSession>()?.currentUser
-                ?: call.request.header("auth-uuid")?.let {
-                    transaction { Users.select { Users.id eq it }.singleOrNull() }
-                }?.toUser() ?: Result.NOT_LOGIN.throwOut()
+//            call.sessions.get<LoginSession>()?.currentUser
+//                ?: call.request.header("auth-uuid")?.let {
+//                    transaction { Users.select { Users.id eq it }.singleOrNull() }
+//                }?.toUser() ?: Result.NOT_LOGIN.throwOut()
             val sha256 = call.parameters["sha256"]!!
             call.respondOutputStream(
                 ContentType.parse(
@@ -189,6 +189,33 @@ fun Application.module() {
                         }
                         return@forEachPart
                     }
+                }
+            }
+            call.sessions.set(LoginSession(newUser))
+            GlobalScope.launch {
+                for (displayIdSession in displayIdSessions) {
+                    if (displayIdSession.key == user.displayId) {
+                        displayIdSession.value.second.sendToOther(
+                            WebSocketFrameWrapper(
+                                WebSocketFrameWrapper.FrameType.UPDATE_USER,
+                                newUser
+                            )
+                        )
+                        break
+                    }
+                }
+            }
+            call.respond(Result(0, null, newUser))
+        }
+        post("/photo/{sha256}") {
+            val user = call.sessions.get<LoginSession>()?.currentUser ?: Result.NOT_LOGIN.throwOut()
+            val sha256 = call.parameters["sha256"]!!
+            val newUser = user.copyBuilder {
+                transaction {
+                    Users.update({ Users.displayId eq user.displayId }) {
+                        it[photo] = sha256
+                    }
+                    this@copyBuilder.photo = sha256
                 }
             }
             call.sessions.set(LoginSession(newUser))
